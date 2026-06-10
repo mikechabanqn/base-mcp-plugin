@@ -5,7 +5,7 @@ tags: [trading, onchain-data, analytics, data-query, hyperliquid]
 name: quicknode
 version: 0.3.1
 integration: http-api
-chains: [base, base-sepolia, polygon]  # payment networks for funding query credits (USDC); the data queried is Hyperliquid/Solana
+chains: [] # sign-only plugin; USDC payment authorization via Base MCP sign but settlement happens outside Base MCP transaction routing
 requires:
   shell: none
   allowlist: [x402.quicknode.com]
@@ -75,11 +75,11 @@ Never print, echo, or log the JWT; keep it in the `Authorization` header only.
 
 ## Surface Routing
 
-| Capability | Coding harness (Claude Code / Cursor / Codex) | Chat-only (Claude.ai / ChatGPT) |
-|---|---|---|
-| Cluster + schema discovery (free, no auth) | Harness HTTP tool → `GET /sql/rest/v1/clusters`, `GET /sql/rest/v1/schema/:clusterId` | `web_request` → same `GET`s (host allowlisted; public, CDN-cached ~1 h) |
-| SIWE auth + credit funding | Base MCP `get_wallets` + `sign`, then `POST /auth` via harness HTTP | Base MCP `get_wallets` + `sign`, then `POST /auth` via `web_request` |
-| Query execution (`POST`, paid) | Harness HTTP tool → `POST /sql/rest/v1/query` with `Authorization: Bearer` | `web_request` → same `POST` (requires `x402.quicknode.com` allowlisted for POST) |
+| Capability                                 | Coding harness (Claude Code / Cursor / Codex)                                         | Chat-only (Claude.ai / ChatGPT)                                                  |
+| ------------------------------------------ | ------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
+| Cluster + schema discovery (free, no auth) | Harness HTTP tool → `GET /sql/rest/v1/clusters`, `GET /sql/rest/v1/schema/:clusterId` | `web_request` → same `GET`s (host allowlisted; public, CDN-cached ~1 h)          |
+| SIWE auth + credit funding                 | Base MCP `get_wallets` + `sign`, then `POST /auth` via harness HTTP                   | Base MCP `get_wallets` + `sign`, then `POST /auth` via `web_request`             |
+| Query execution (`POST`, paid)             | Harness HTTP tool → `POST /sql/rest/v1/query` with `Authorization: Bearer`            | `web_request` → same `POST` (requires `x402.quicknode.com` allowlisted for POST) |
 
 If `web_request` cannot reach the `POST` endpoints on a chat-only surface, stop and tell the user that auth and query execution require a coding harness or allowlist access — do not improvise a workaround. Schema discovery still works everywhere.
 
@@ -122,18 +122,16 @@ curl -X POST 'https://x402.quicknode.com/sql/rest/v1/query' \
 
 Request body:
 
-| Field | Required | Description |
-|---|---|---|
-| `query` | yes | A read-only SQL `SELECT` statement |
-| `clusterId` | yes | Target cluster from `GET /clusters`, e.g. `hyperliquid-core-mainnet` |
+| Field       | Required | Description                                                          |
+| ----------- | -------- | -------------------------------------------------------------------- |
+| `query`     | yes      | A read-only SQL `SELECT` statement                                   |
+| `clusterId` | yes      | Target cluster from `GET /clusters`, e.g. `hyperliquid-core-mainnet` |
 
 Response (1:1 pass-through of the SQL Explorer API):
 
 ```json
 {
-  "meta": [
-    { "name": "time", "type": "DateTime64(6, 'UTC')" }
-  ],
+  "meta": [{ "name": "time", "type": "DateTime64(6, 'UTC')" }],
   "data": [
     {
       "time": "2026-03-30 16:24:00.058516",
@@ -222,23 +220,19 @@ Query constraints:
    ```sql
    SELECT time, validator, reward, block_number
    FROM hyperliquid_validator_rewards
+   WHERE block_time >= now() - INTERVAL 7 DAY
    ORDER BY block_number DESC
    LIMIT 100
    ```
 3. Summarize: validator, reward, block, time. If `rows_before_limit_at_least` exceeds 100, offer the next page with `OFFSET 100`.
 
-**What system actions happened in the last day?**
+**Run my query — credits ran out mid-session**
 
-1. Schema known for `hyperliquid_system_actions` (block_time, action_type, user, ...).
-2. Execute:
-   ```sql
-   SELECT toDateTime(block_time) AS time, action_type, user
-   FROM hyperliquid_system_actions
-   WHERE block_time >= now() - INTERVAL 1 DAY
-   ORDER BY block_time DESC
-   LIMIT 100
-   ```
-3. Group the summary by `action_type`; show the most recent examples of each.
+1. `POST /sql/rest/v1/query` with the Bearer JWT returns `402` — credits exhausted. The response body (and the base64-encoded `payment-required` header) carries the payment requirements, including the live `accepts` array.
+2. Confirm with the user before paying: state the bundle price (e.g. mainnet $10 USDC → 1,000,000 credits) and wait for explicit approval — credit purchases are irreversible.
+3. Sign the USDC payment via Base MCP `sign`, taking `payTo`/`asset`/`amount` from the 402's live `accepts` array — never from hardcoded or documented values.
+4. Retry the same `POST /sql/rest/v1/query` with the payment attached **and the `Authorization: Bearer <JWT>` header re-attached** — dropping the header on the retry is the known footgun that turns the retry into a `401`.
+5. Return the query rows as usual; report the new balance via `GET /credits` if the user asks.
 
 **Show me the largest liquidations in the last 24 hours**
 
@@ -284,25 +278,6 @@ Liquidations are not a separate event table — they are fills flagged with `is_
    ```
 3. Summarize: time, coin, direction, price, size, PnL; offer pagination if `rows_before_limit_at_least` exceeds 100.
 
-**What are the top coins by trading volume in the last 24 hours?**
-
-1. Schema known for `hyperliquid_trades` (timestamp, coin, price, size; partition on `block_time`).
-2. Execute:
-   ```sql
-   SELECT
-     coin,
-     count() AS trade_count,
-     sum(toFloat64(price) * toFloat64(size)) AS volume_usd,
-     min(toFloat64(price)) AS low,
-     max(toFloat64(price)) AS high
-   FROM hyperliquid_trades
-   WHERE block_time > now() - INTERVAL 24 HOUR
-   GROUP BY coin
-   ORDER BY volume_usd DESC
-   LIMIT 50
-   ```
-3. Present: coin, trade count, volume, price range. For perp-vs-spot breakdowns use `hyperliquid_dex_trades` (`market_type`, `usd_amount` precomputed); for longer windows use `hyperliquid_market_volume_hourly` (pre-aggregated OHLCV — much cheaper).
-
 ## Risks & Warnings
 
 - **Credit purchases are irreversible.** Funding credits signs a real USDC transfer that settles onchain and cannot be undone. Credits are prepaid drawdown against future queries. Always confirm with the user before signing a payment. (Mainnet bundle: $10 USDC → 1M credits.)
@@ -315,7 +290,7 @@ Liquidations are not a separate event table — they are fills flagged with `is_
 - Live clusters (verified via the free endpoint): `hyperliquid-core-mainnet` (46 tables, billions of rows, monthly time-based partitions) and `solana-mainnet`. The cluster list and schemas evolve — `GET /clusters` and `GET /schema/:clusterId` are the source of truth; responses are CDN-cached ~1 hour, so after a schema change a column-not-found error may need a cache-aged re-fetch rather than a blind retry.
 - All example queries use table and column names verified against the live gateway schema. For any other table, confirm names from the schema before composing SQL — do not guess.
 - Liquidation data lives on `hyperliquid_fills` (`is_liquidation`, `liquidated_user`, `liquidation_mark_price`, `liquidation_method`) and in the `hyperliquid_liquidations_hourly` aggregate — there is no standalone liquidations event table.
-- Per-side fill data is in `hyperliquid_fills`; matched two-sided trades are in `hyperliquid_trades` (buyer_*/seller_* columns); `hyperliquid_dex_trades` is an enriched view with `usd_amount` and `market_type` precomputed.
+- Per-side fill data is in `hyperliquid_fills`; matched two-sided trades are in `hyperliquid_trades` (buyer*\*/seller*\* columns); `hyperliquid_dex_trades` is an enriched view with `usd_amount` and `market_type` precomputed.
 - Pre-aggregated tables for cheap analytics: `hyperliquid_market_volume_hourly` (OHLCV), `hyperliquid_funding_summary_hourly`, `hyperliquid_liquidations_hourly`, `hyperliquid_metrics_overview` / `hyperliquid_metrics_dex_overview` (daily).
 - Testnet end-to-end testing is free: SIWE auth on Base Sepolia → `POST /drip` faucets USDC → fund credits → query. Testnet credits share a 1M/month cap per wallet; mainnet is uncapped.
 - For Quicknode account holders, the same API is also reachable directly at `api.quicknode.com/sql/rest` with an `x-api-key` header — outside this plugin's flow.
