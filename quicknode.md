@@ -3,7 +3,7 @@ title: "Quicknode SQL Explorer Plugin"
 description: "Read-only SQL queries against indexed onchain data (Hyperliquid, Solana) via Quicknode's x402 gateway. Free schema discovery; paid queries via SIWE-authenticated credit drawdown funded with USDC. No calldata, no send_calls."
 tags: [trading, onchain-data, analytics, data-query, hyperliquid]
 name: quicknode
-version: 0.3.0
+version: 0.3.1
 integration: http-api
 chains: [base, base-sepolia, polygon]  # payment networks for funding query credits (USDC); the data queried is Hyperliquid/Solana
 requires:
@@ -35,9 +35,32 @@ Auth model: **SIWE → session JWT → credit drawdown** (x402 v2). Per-request 
 Ordered flow:
 
 1. **Get address** — `get_wallets` → the agent's wallet address.
-2. **Start** — send the query request (or any `/sql/rest/*` POST) unauthenticated; the `402` response carries everything needed: a `sign-in-with-x` extension with the exact SIWE parameters (`domain: x402.quicknode.com`, `uri`, `version`, a server-issued `nonce` valid ~5 minutes) and an `accepts` array listing payment options. Read these from the response — **never hardcode payment addresses or nonces**.
-3. **Sign** — sign the SIWE message via Base MCP `sign` (EIP-191 for EVM chains; the gateway also accepts SIWX/ed25519 for Solana wallets).
-4. **Complete** — `POST https://x402.quicknode.com/auth` with the message + signature → `{ "token": "<JWT>", "expiresAt": "<ISO>", "accountId": "<CAIP-10>" }`. Rate limit: 10 requests / 10 s / IP.
+2. **Start** — send the query request (or any `/sql/rest/*` POST) unauthenticated; the `402` response carries a `sign-in-with-x` extension (SIWE parameters incl. a server-issued `nonce` valid ~5 minutes) and an `accepts` array listing payment options. Read payment details from this response — **never hardcode payment addresses**. ⚠️ Do **not** sign the 402's SIWE info verbatim: compose the message from the exact field list in step 3 — the gateway rejects messages containing `Expiration Time` or `Resources` lines (`401 invalid_signature`) even though the 402 supplies both fields.
+3. **Compose & sign** — build an EIP-4361 message with exactly these fields, then sign via Base MCP `sign` (EIP-191 for EVM chains; the gateway also accepts SIWX/ed25519 for Solana wallets):
+   - `domain`: `x402.quicknode.com`
+   - `address`: the wallet address from `get_wallets`
+   - `statement` — **required, exact string**: `I accept the Quicknode Terms of Service: https://www.quicknode.com/terms` (missing or altered → `401 invalid_statement`; this string is not present in the 402 response)
+   - `uri`: `https://x402.quicknode.com`
+   - `version`: `1`
+   - `chainId`: numeric payment chain id (`8453` Base mainnet, `84532` Base Sepolia)
+   - `nonce`: the 402's nonce (a fresh client-generated ≥8-char value is also accepted)
+   - `issuedAt`: current ISO-8601 timestamp
+   - **Omit all other fields** — `Expiration Time`, `Resources`, `Not Before`, `Request ID` each break signature verification.
+
+   ```text
+   x402.quicknode.com wants you to sign in with your Ethereum account:
+   0x<YourWalletAddress>
+
+   I accept the Quicknode Terms of Service: https://www.quicknode.com/terms
+
+   URI: https://x402.quicknode.com
+   Version: 1
+   Chain ID: 84532
+   Nonce: <nonce>
+   Issued At: 2026-06-10T21:57:28.417Z
+   ```
+
+4. **Complete** — `POST https://x402.quicknode.com/auth` with `{ "message": "<full SIWE text>", "signature": "0x…", "type": "siwx" }` (`type` is optional; enum `siwe` | `siwx`) → `{ "token": "<JWT>", "expiresAt": "<ISO>", "accountId": "<CAIP-10>" }`. Rate limit: 10 requests / 10 s / IP.
 5. **Reuse the token** — send `Authorization: Bearer <JWT>` on all paid requests. **The JWT expires in 1 hour**; on `401`/expiry, re-run the `/auth` flow. (Client-implementation footgun from Quicknode's own docs: on 402-pay-retry loops, the retried request must re-attach the `Authorization` header or it 401s.)
 
 Credits:
@@ -160,9 +183,10 @@ Query constraints:
 
 2. Authenticate (paid path; once per session, JWT lives 1 h)
    get_wallets → address
-   first unauthenticated request → 402 → read sign-in-with-x extension (SIWE params + nonce)
+   first unauthenticated request → 402 → nonce from sign-in-with-x; payment options from accepts
+   compose SIWE message per ## Auth (ToS statement required; omit Expiration Time/Resources)
    sign via Base MCP `sign` (EIP-191)
-   POST /auth { message, signature }  → { token, expiresAt, accountId }
+   POST /auth { message, signature, type: "siwx" } → { token, expiresAt, accountId }
    GET /credits (Bearer JWT)          → balance
 
 3. Write the query
